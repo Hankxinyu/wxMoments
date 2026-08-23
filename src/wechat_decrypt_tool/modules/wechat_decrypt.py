@@ -4,7 +4,9 @@ import hashlib
 import hmac
 import os
 import json
+import sqlite3
 import struct
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,15 @@ SALT_SIZE = 16
 IV_SIZE = 16
 HMAC_SIZE = 64
 RESERVE_SIZE = IV_SIZE + HMAC_SIZE
+
+# WAL (Write-Ahead Log) frame layout — shared with the main database page format.
+# SQLCipher WAL frames keep their 24-byte frame header (page number / commit-size /
+# salt-1 / salt-2 / checksum-1 / checksum-2) in plaintext; only the page payload is
+# encrypted, using the same derived encryption key as the main database pages.
+WAL_HEADER_SIZE = 32
+WAL_FRAME_HEADER_SIZE = 24
+WAL_MAGIC_BE = 0x377F0682  # big-endian checksum variant
+WAL_MAGIC_LE = 0x377F0683  # little-endian checksum variant
 
 
 def _derive_mac_key(enc_key: bytes, salt: bytes) -> bytes:
@@ -273,6 +284,185 @@ def _decrypt_page(enc_key: bytes, page: bytes, page_num: int) -> bytes:
     if page_num == 1:
         return SQLITE_HEADER + decrypted_page + (b"\x00" * RESERVE_SIZE)
     return decrypted_page + (b"\x00" * RESERVE_SIZE)
+
+
+def _parse_sqlcipher_wal_frames(
+    enc_key: bytes, wal_path: str | Path
+) -> tuple[list | None, int]:
+    """Parse an SQLCipher WAL file and decrypt every frame's page payload.
+
+    SQLCipher WAL frames keep a 24-byte plaintext frame header (page number,
+    commit database-size, salt-1, salt-2, checksum-1, checksum-2) followed by an
+    encrypted page of ``PAGE_SIZE`` bytes. The page is encrypted with the same key
+    derived for the main database, so ``_decrypt_page`` can be reused directly.
+
+    Returns ``(epoch_groups, frame_count)`` where ``epoch_groups`` is an ordered
+    list of ``[salt, [(pgno, dbsize, decrypted_page), ...]]`` grouped by the frame
+    salt, or ``(None, 0)`` if the path is missing / not a usable WAL.
+    """
+    wal_path = Path(wal_path)
+    try:
+        if not wal_path.exists() or not wal_path.is_file():
+            return None, 0
+        wal = wal_path.read_bytes()
+    except Exception:
+        return None, 0
+
+    if len(wal) < WAL_HEADER_SIZE:
+        return None, 0
+    try:
+        magic = struct.unpack(">I", wal[:4])[0]
+    except Exception:
+        return None, 0
+    if magic not in (WAL_MAGIC_BE, WAL_MAGIC_LE):
+        return None, 0
+
+    epochs: list[list] = []
+    salt_index: dict[tuple[int, int], int] = {}
+    off = WAL_HEADER_SIZE
+    frame_count = 0
+    while off + WAL_FRAME_HEADER_SIZE + PAGE_SIZE <= len(wal):
+        try:
+            pgno, dbsize = struct.unpack(">II", wal[off : off + 8])
+            s1, s2 = struct.unpack(">II", wal[off + 8 : off + 16])
+        except Exception:
+            break
+        salt = (s1, s2)
+        if pgno <= 0 or pgno > 1_000_000:
+            off += WAL_FRAME_HEADER_SIZE + PAGE_SIZE
+            continue
+
+        frame_data = wal[off + WAL_FRAME_HEADER_SIZE : off + WAL_FRAME_HEADER_SIZE + PAGE_SIZE]
+        try:
+            page = _decrypt_page(enc_key, frame_data, pgno)
+        except Exception:
+            page = b"\x00" * PAGE_SIZE
+
+        idx = salt_index.get(salt)
+        if idx is None:
+            idx = len(epochs)
+            salt_index[salt] = idx
+            epochs.append([salt, []])
+        epochs[idx][1].append((pgno, dbsize, page))
+        frame_count += 1
+        off += WAL_FRAME_HEADER_SIZE + PAGE_SIZE
+
+    return epochs, frame_count
+
+
+def _run_sqlite_quick_check(data: bytes) -> tuple[bool, str]:
+    """Run ``PRAGMA quick_check`` over an in-memory decrypted database buffer.
+
+    Returns ``(ok, message)``. Used to validate a WAL-merged database before
+    trusting it; on failure the caller falls back to the plain main-file output.
+    """
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        conn = sqlite3.connect(tmp_path)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            ok = bool(row and str(row[0] or "").strip().lower() == "ok")
+            return ok, (str(row[0]) if row else "")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {' '.join(str(exc).split())[:180]}"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _merge_sqlcipher_wal_into_decrypted(
+    enc_key: bytes,
+    wal_path: str | Path,
+    decrypted_main: bytes,
+) -> tuple[bytes | None, dict[str, Any]]:
+    """Merge the current-epoch WAL frames into the decrypted main database pages.
+
+    When WeChat is running, newly written rows (e.g. fresh Moments posts) may only
+    exist inside the ``-wal`` file that has not been checkpointed back into the
+    main database. The main-file-only decrypt therefore silently drops them.
+
+    A WAL can accumulate several salt epochs across checkpoints; only frames of
+    the *current* epoch (those whose commit ``dbsize`` equals the largest seen
+    across the whole WAL) describe the live state. Older epochs describe already
+    checkpointed snapshots and must be skipped — applying them corrupts the merge.
+
+    Returns ``(merged_data, meta)``. ``merged_data`` is ``None`` when no usable
+    WAL exists; otherwise the caller must still validate it with
+    ``_run_sqlite_quick_check`` before writing (fall back to the main-only output
+    on failure).
+    """
+    meta: dict[str, Any] = {
+        "wal": False,
+        "frames": 0,
+        "epochs": 0,
+        "selected_epochs": [],
+        "max_dbsize": 0,
+        "merged_pages": 0,
+        "target_pages": 0,
+    }
+
+    epochs, frame_count = _parse_sqlcipher_wal_frames(enc_key, wal_path)
+    if not epochs:
+        return None, meta
+    meta["wal"] = True
+    meta["frames"] = frame_count
+    meta["epochs"] = len(epochs)
+
+    global_max = 0
+    for _salt, frames in epochs:
+        for _pgno, dbsize, _page in frames:
+            if dbsize and int(dbsize) > global_max:
+                global_max = int(dbsize)
+    if global_max <= 0:
+        return None, meta
+    meta["max_dbsize"] = global_max
+
+    # Current epoch(s): those containing a frame committed at the largest size.
+    selected = [
+        (salt, frames) for salt, frames in epochs
+        if any(int(dbsize) == global_max for _pgno, dbsize, _page in frames)
+    ]
+    meta["selected_epochs"] = [
+        "%08x_%08x" % (int(salt[0]), int(salt[1])) for salt, _frames in selected
+    ]
+
+    n_main = len(decrypted_main) // PAGE_SIZE
+    pages: dict[int, bytes] = {}
+    for i in range(1, n_main + 1):
+        start = (i - 1) * PAGE_SIZE
+        pages[i] = bytes(decrypted_main[start : start + PAGE_SIZE])
+
+    maxp = n_main
+    merged_count = 0
+    for _salt, frames in selected:
+        for pgno, _dbsize, page in frames:
+            pages[pgno] = page
+            if pgno > maxp:
+                maxp = pgno
+            merged_count += 1
+    maxp = max(maxp, global_max)
+    meta["merged_pages"] = merged_count
+    meta["target_pages"] = maxp
+
+    out = bytearray()
+    for i in range(1, maxp + 1):
+        out += pages.get(i, b"\x00" * PAGE_SIZE)
+
+    # Fix SQLite header: page count + reset freelist trunk count.
+    out[28:32] = struct.pack(">I", maxp)
+    out[36:40] = struct.pack(">I", 0)
+    return bytes(out), meta
 
 
 def _normalize_account_name(name: str) -> str:
@@ -579,6 +769,7 @@ class WeChatDatabaseDecryptor:
             "output_header_debug": {},
             "diagnostics": {},
             "diagnostic_status": "not_run",
+            "wal_merge": {"attempted": False, "applied": False},
             "error": "",
         }
         self.last_result = result
@@ -657,6 +848,7 @@ class WeChatDatabaseDecryptor:
                 "output_header_debug": result["output_header_debug"],
                 "diagnostic_status": result["diagnostic_status"],
                 "diagnostics": result["diagnostics"],
+                "wal_merge": result.get("wal_merge") or {},
                 "error": result["error"],
             }
             log_fn = logger.info
@@ -890,6 +1082,55 @@ class WeChatDatabaseDecryptor:
 
             result["successful_pages"] = int(successful_pages)
             result["failed_pages"] = int(failed_pages)
+
+            # --- WAL recovery merge ---
+            # When WeChat is running, freshly written rows (new Moments posts) may
+            # only exist in the -wal file that has not yet been checkpointed into
+            # the main database. Decrypting the main file alone silently drops
+            # them. Try to merge the current-epoch WAL frames on top of the
+            # decrypted main pages, validate with PRAGMA quick_check, and only
+            # keep the merged result when it is healthy.
+            wal_path = Path(str(db_path) + "-wal")
+            result["wal_merge"] = {"attempted": False}
+            if wal_path.exists() and wal_path.is_file():
+                merged_data, merge_meta = _merge_sqlcipher_wal_into_decrypted(
+                    enc_key,
+                    wal_path,
+                    bytes(decrypted_data),
+                )
+                result["wal_merge"] = dict(merge_meta)
+                result["wal_merge"]["attempted"] = True
+                if merged_data is not None:
+                    qc_ok, qc_msg = _run_sqlite_quick_check(merged_data)
+                    result["wal_merge"]["quick_check_ok"] = bool(qc_ok)
+                    result["wal_merge"]["quick_check"] = str(qc_msg)[:200]
+                    if qc_ok:
+                        old_len = int(len(decrypted_data))
+                        decrypted_data = bytearray(merged_data)
+                        result["wal_merge"]["applied"] = True
+                        result["wal_merge"]["main_output_size"] = old_len
+                        result["expected_output_size"] = int(len(decrypted_data))
+                        logger.info(
+                            "[decrypt.wal_merge] applied db=%s main_bytes=%s merged_bytes=%s frames=%s epochs=%s selected=%s target_pages=%s",
+                            result["db_name"],
+                            old_len,
+                            int(len(decrypted_data)),
+                            int(merge_meta.get("frames") or 0),
+                            int(merge_meta.get("epochs") or 0),
+                            str(merge_meta.get("selected_epochs") or ""),
+                            int(merge_meta.get("target_pages") or 0),
+                        )
+                    else:
+                        result["wal_merge"]["applied"] = False
+                        logger.warning(
+                            "[decrypt.wal_merge] rejected after quick_check db=%s msg=%s frames=%s selected=%s (fallback: main file only)",
+                            result["db_name"],
+                            str(qc_msg)[:200],
+                            int(merge_meta.get("frames") or 0),
+                            str(merge_meta.get("selected_epochs") or ""),
+                        )
+                else:
+                    result["wal_merge"]["applied"] = False
 
             with open(output_path, 'wb') as f:
                 f.write(decrypted_data)
