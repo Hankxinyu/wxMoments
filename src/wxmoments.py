@@ -18,6 +18,17 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+CONFIG_DIR = PROJECT_ROOT / "config"
+DEFAULT_CONFIG = CONFIG_DIR / "config.json"
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+OUTPUT_RUNTIME_DIR = RUNTIME_DIR / "output"
+
+os.environ.setdefault("WECHAT_TOOL_DATA_DIR", str(RUNTIME_DIR))
+os.environ.setdefault("WECHAT_TOOL_OUTPUT_DIR", str(OUTPUT_RUNTIME_DIR))
+os.environ.setdefault("WECHAT_TOOL_BUILD_SESSION_LAST_MESSAGE", "0")
+
 from wechat_decrypt_tool.modules.constants import (
     MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_LIVE_PHOTO,
     POST_TYPE_NORMAL, POST_TYPE_ARTICLE, POST_TYPE_LINK, POST_TYPE_COVER,
@@ -30,16 +41,10 @@ from wechat_decrypt_tool.modules.constants import (
 )
 from wechat_decrypt_tool.modules.wechat_emoji import emojify_wechat_shortcodes
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-CONFIG_DIR = PROJECT_ROOT / "config"
-DEFAULT_CONFIG = CONFIG_DIR / "config.json"
-RUNTIME_DIR = PROJECT_ROOT / "runtime"
-OUTPUT_RUNTIME_DIR = RUNTIME_DIR / "output"
 
-os.environ.setdefault("WECHAT_TOOL_DATA_DIR", str(RUNTIME_DIR))
-os.environ.setdefault("WECHAT_TOOL_OUTPUT_DIR", str(OUTPUT_RUNTIME_DIR))
-os.environ.setdefault("WECHAT_TOOL_BUILD_SESSION_LAST_MESSAGE", "0")
+# Older WeChat SNS XML uses media type 6 for short videos, while newer
+# payloads handled by the bundled parser may use MEDIA_TYPE_VIDEO (1).
+SNS_VIDEO_MEDIA_TYPES = {MEDIA_TYPE_VIDEO, 6}
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,7 @@ class ExportedPost:
     body: str
     images: list[str]
     interactions: str = ""
+    video_cover_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -69,7 +75,7 @@ class ContactEntry:
     source_table: str = ""
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="导出微信朋友圈为 Markdown、HTML 和 PDF")
     parser.add_argument("--key", default="", help=argparse.SUPPRESS)
     parser.add_argument("--start", default="", help="起始时间，例如 20260606；留空表示不限制")
@@ -77,11 +83,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only-self", default="", help="是否只导出自己的朋友圈: y/n，默认 y")
     parser.add_argument("--keep-interactions", default="", help="是否保留点赞评论: y/n，默认 n")
     parser.add_argument("--export-contacts", default="", help="是否导出好友列表: y/n，默认 n")
+    parser.add_argument("--max-posts", type=int, default=0, help="最多导出多少条；0 表示不限制")
+    parser.add_argument("--order", choices=("newest", "oldest"), default="newest", help="导出顺序，默认 newest")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help=argparse.SUPPRESS)
     parser.add_argument("--output-root", default="", help=argparse.SUPPRESS)
     parser.add_argument("--no-download", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -132,7 +140,17 @@ def parse_datetime(value: str, *, end_of_day: bool) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
         return None
-    for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    formats = (
+        (r"\d{14}", "%Y%m%d%H%M%S"),
+        (r"\d{12}", "%Y%m%d%H%M"),
+        (r"\d{8}", "%Y%m%d"),
+        (r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", "%Y-%m-%d %H:%M:%S"),
+        (r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", "%Y-%m-%d %H:%M"),
+        (r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d"),
+    )
+    for pattern, fmt in formats:
+        if not re.fullmatch(pattern, raw):
+            continue
         try:
             parsed = datetime.strptime(raw, fmt)
             if fmt in {"%Y%m%d", "%Y-%m-%d"} and end_of_day:
@@ -705,6 +723,35 @@ def resolve_sns_exact_cached_image_path(wxid_dir: Path, post: dict[str, Any], me
     return None
 
 
+def timeline_post_dedupe_key(post: dict[str, Any]) -> tuple[Any, ...]:
+    raw_id = str(post.get("id") or post.get("tid") or "").strip()
+    if raw_id:
+        try:
+            return ("id", str(int(raw_id) & 0xFFFFFFFFFFFFFFFF))
+        except (TypeError, ValueError):
+            return ("id", raw_id)
+    return (
+        "fallback",
+        str(post.get("username") or "").strip(),
+        int(post.get("createTime") or 0),
+        str(post.get("contentDesc") or ""),
+        str(post.get("title") or ""),
+        str(post.get("contentUrl") or ""),
+    )
+
+
+def dedupe_timeline_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for post in posts:
+        key = timeline_post_dedupe_key(post)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(post)
+    return out
+
+
 def load_timeline(account_dir: Path, usernames: list[str] | None = None, *, source: str = "auto") -> list[dict[str, Any]]:
     from wechat_decrypt_tool.modules.sns_reader import list_sns_timeline
 
@@ -726,7 +773,7 @@ def load_timeline(account_dir: Path, usernames: list[str] | None = None, *, sour
         if not response.get("hasMore") or not page:
             break
         offset += len(page)
-    return posts
+    return dedupe_timeline_posts(posts)
 
 
 def post_created_datetime(post: dict[str, Any]) -> datetime | None:
@@ -820,7 +867,9 @@ def self_username_candidates(account_info: AccountInfo, config: dict[str, Any]) 
     raw_one = str(config.get("self_username") or "").strip()
     if raw_one:
         values.append(raw_one)
-    values.extend([account_info.account, account_info.wxid_dir.name])
+    directory_name = account_info.wxid_dir.name
+    directory_without_hash = re.sub(r"_[0-9a-fA-F]{4}$", "", directory_name)
+    values.extend([account_info.account, directory_name, directory_without_hash])
     out: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -1348,16 +1397,17 @@ async def choose_image(
     media: dict[str, Any],
     *,
     allow_download: bool,
+    prefer_thumb: bool = False,
 ) -> tuple[bytes, str, str]:
     if allow_download:
-        payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=False)
+        payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=prefer_thumb)
         if payload:
             return payload, mt, source
     local_payload, local_mt, local_source = read_local_image(account_info, account_dir, post, media)
     expected = expected_image_size(media)
     if local_payload and meets_expected_size(local_payload, local_mt, expected):
         return local_payload, local_mt, local_source
-    if allow_download:
+    if allow_download and not prefer_thumb:
         payload, mt, source = await fetch_remote_image(account_dir, media, prefer_thumb=True)
         if payload:
             return payload, mt, source
@@ -1369,6 +1419,43 @@ async def choose_image(
 def mime_to_ext(media_type: str) -> str:
     from wechat_decrypt_tool.modules.sns_media import mime_to_ext as _impl
     return _impl(media_type)
+
+
+def post_visual_media(post: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    """Return images and usable video covers without downloading video payloads."""
+    out: list[tuple[dict[str, Any], str]] = []
+    seen_urls: set[str] = set()
+
+    for raw in post.get("media") or []:
+        media = raw if isinstance(raw, dict) else {}
+        if not media:
+            continue
+        try:
+            media_type = int(media.get("type") or 0)
+        except (TypeError, ValueError):
+            media_type = 0
+        if media_type == MEDIA_TYPE_IMAGE:
+            kind = "image"
+            dedupe_url = pick_sns_media_str(media.get("url"), media.get("thumb"))
+        elif media_type in SNS_VIDEO_MEDIA_TYPES | {MEDIA_TYPE_LIVE_PHOTO}:
+            kind = "video_cover"
+            dedupe_url = pick_sns_media_str(media.get("thumb"), media.get("thumbUrl"), media.get("thumb_url"))
+            if not dedupe_url:
+                continue
+        else:
+            continue
+        if dedupe_url and dedupe_url in seen_urls:
+            continue
+        if dedupe_url:
+            seen_urls.add(dedupe_url)
+        out.append((media, kind))
+
+    finder = post.get("finderFeed") if isinstance(post.get("finderFeed"), dict) else {}
+    finder_thumb = pick_sns_media_str(finder.get("thumbUrl"), finder.get("coverUrl"))
+    if finder_thumb and finder_thumb not in seen_urls:
+        out.append(({"type": MEDIA_TYPE_IMAGE, "thumb": finder_thumb}, "video_cover"))
+
+    return out
 
 
 async def export_markdown(
@@ -1383,10 +1470,14 @@ async def export_markdown(
     contact_names: dict[str, str],
     *,
     allow_download: bool,
+    max_posts: int = 0,
+    order: str = "newest",
 ) -> tuple[dict[str, Any], list[ExportedPost]]:
     figure = output / "figure"
     figure.mkdir(parents=True, exist_ok=True)
-    posts = load_timeline(account_dir, usernames, source="auto")
+    # Export from one immutable decrypted snapshot. Mixing realtime page 1 with
+    # decrypted later pages can change the row set while an export is running.
+    posts = load_timeline(account_dir, usernames, source="decrypted")
     filtered: list[dict[str, Any]] = []
     for post in posts:
         created_ts = int(post.get("createTime") or 0)
@@ -1398,7 +1489,9 @@ async def export_markdown(
         if end and created > end:
             continue
         filtered.append(post)
-    filtered.sort(key=lambda item: int(item.get("createTime") or 0), reverse=True)
+    filtered.sort(key=lambda item: int(item.get("createTime") or 0), reverse=order != "oldest")
+    if max_posts > 0:
+        filtered = filtered[:max_posts]
     interaction_contact_names = dict(contact_names)
     interaction_contact_names.update(build_self_display_lookup(account_info, config, filtered, contact_names))
     coverage = build_coverage_report(posts, filtered, start, end)
@@ -1413,6 +1506,8 @@ async def export_markdown(
         "missing_images": 0,
         "stickers": 0,
         "missing_stickers": 0,
+        "video_covers": 0,
+        "missing_video_covers": 0,
         "local_earliest": coverage.get("local_earliest", ""),
         "local_latest": coverage.get("local_latest", ""),
         "coverage_gap_count": len(coverage.get("large_gaps") or []),
@@ -1436,22 +1531,27 @@ async def export_markdown(
         if content_url:
             body = f"{body}\n\n🔗 **链接**：{content_url}" if body else f"🔗 **链接**：{content_url}"
         lines.extend([body, ""])
+        if location:
+            lines.extend([f"📍 {location}", ""])
 
         post_dir = unique_post_dir(figure, created)
         image_index = 0
         post_images: list[str] = []
-        for media_raw in post.get("media") or []:
-            media = media_raw if isinstance(media_raw, dict) else {}
-            try:
-                media_type = int(media.get("type") or 0)
-            except Exception as exc:
-                print(f"[warning] {exc}", file=sys.stderr)
-                media_type = 0
-            if media_type != MEDIA_TYPE_IMAGE:
-                continue
-            payload, mt, source = await choose_image(account_info, account_dir, post, media, allow_download=allow_download)
+        post_video_cover_count = 0
+        for media, visual_kind in post_visual_media(post):
+            payload, mt, source = await choose_image(
+                account_info,
+                account_dir,
+                post,
+                media,
+                allow_download=allow_download,
+                prefer_thumb=visual_kind == "video_cover",
+            )
             if not payload:
-                stats["missing_images"] += 1
+                if visual_kind == "video_cover":
+                    stats["missing_video_covers"] += 1
+                else:
+                    stats["missing_images"] += 1
                 continue
             image_index += 1
             post_dir.mkdir(parents=True, exist_ok=True)
@@ -1460,9 +1560,15 @@ async def export_markdown(
             target.write_bytes(payload)
             rel = target.relative_to(output).as_posix()
             post_images.append(rel)
-            lines.extend([f"![{time_text} image {image_index}]({rel})", ""])
+            alt_kind = "video cover" if visual_kind == "video_cover" else "image"
+            if visual_kind == "video_cover" and post_video_cover_count == 0:
+                lines.extend(["🎬 **视频封面**（视频本体未导出）", ""])
+            lines.extend([f"![{time_text} {alt_kind} {image_index}]({rel})", ""])
             stats["images"] += 1
-            if source.startswith("remote") and "thumb" not in source:
+            if visual_kind == "video_cover":
+                post_video_cover_count += 1
+                stats["video_covers"] += 1
+            elif source.startswith("remote") and "thumb" not in source:
                 stats["original_images"] += 1
             else:
                 stats["fallback_images"] += 1
@@ -1489,6 +1595,7 @@ async def export_markdown(
                 body=body,
                 images=post_images,
                 interactions=interactions,
+                video_cover_count=post_video_cover_count,
             )
         )
         print(f"  ({idx}/{total}) {time_text} {display}", flush=True)
@@ -1568,6 +1675,30 @@ def optimized_pdf_image_uri(output: Path, rel: str, max_side: int = 640, quality
         return source.resolve().as_uri()
 
 
+def pdf_single_image_cell_style(
+    output: Path,
+    rel: str,
+    max_width: int = 300,
+    max_height: int = 330,
+) -> str:
+    """Size a single-image cell to the image itself instead of a fixed placeholder."""
+    source = output / rel
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(source) as image:
+            image = ImageOps.exif_transpose(image)
+            width, height = image.size
+        if width <= 0 or height <= 0:
+            return ""
+        scale = min(float(max_width) / width, float(max_height) / height)
+        display_width = max(1.0, width * scale)
+        display_height = max(1.0, height * scale)
+        return f' style="width: {display_width:.2f}px; height: {display_height:.2f}px;"'
+    except Exception:
+        return ""
+
+
 def write_pdf_html(
     output: Path,
     posts: list[ExportedPost],
@@ -1584,6 +1715,8 @@ body { margin: 0; color: #1f2328; background: #fff; font-family: -apple-system, 
 .time { font-size: 18px; font-weight: 700; margin: 0 0 7px; letter-spacing: .01em; }
 .body { font-size: 14px; }
 .body p { margin: 0 0 6px; white-space: normal; overflow-wrap: anywhere; }
+.location { margin: 5px 0 0; color: #667085; font-size: 12.5px; }
+.media-note { margin: 6px 0 2px; color: #667085; font-size: 12px; }
 .interactions { margin-top: 7px; padding: 7px 9px; background: #f6f8fa; border-left: 3px solid #8ace9b; border-radius: 8px; color: #3f4b4f; font-size: 12px; }
 .interactions p { margin: 0 0 3px; }
 .inline-sticker { display: inline-block; width: 34px; height: 34px; object-fit: contain; vertical-align: middle; margin: 0 2px; border-radius: 6px; }
@@ -1593,9 +1726,9 @@ body { margin: 0; color: #1f2328; background: #fff; font-family: -apple-system, 
 .grid-3, .grid-three { grid-template-columns: repeat(3, 1fr); }
 .grid-four { grid-template-columns: repeat(2, 1fr); max-width: 272px; }
 .image-cell { width: 100%; aspect-ratio: 1 / 1; overflow: hidden; background: #f3f4f6; border-radius: 6px; }
-.grid-one .image-cell { aspect-ratio: auto; }
-.image-cell img { display: block; width: 100%; height: 100%; object-fit: cover; }
-.grid-one .image-cell img { width: auto; max-width: 100%; height: auto; max-height: 330px; object-fit: contain; }
+.grid-one .image-cell { width: auto; height: auto; aspect-ratio: auto; background: transparent; }
+.image-cell img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.grid-one .image-cell img { width: 100%; height: 100%; object-fit: contain; }
 """
     parts = [
         "<!doctype html>",
@@ -1612,11 +1745,16 @@ body { margin: 0; color: #1f2328; background: #fff; font-family: -apple-system, 
         parts.append('<article class="moment">')
         parts.append(f'<h2 class="time">{html.escape(post_heading_text(post))}</h2>')
         parts.append(f'<div class="body">{markdown_text_to_html(post.body, output, file_uris=optimize_images)}</div>')
+        if post.location:
+            parts.append(f'<div class="location">📍 {html.escape(post.location)}</div>')
+        if post.video_cover_count:
+            parts.append('<div class="media-note">🎬 视频封面（视频本体未导出）</div>')
         if post.images:
             parts.append(f'<div class="images {image_grid_class(len(post.images))}">')
             for rel in post.images:
                 src = optimized_pdf_image_uri(output, rel) if optimize_images else rel
-                parts.append(f'<div class="image-cell"><img src="{html.escape(src, quote=True)}"></div>')
+                cell_style = pdf_single_image_cell_style(output, rel) if len(post.images) == 1 else ""
+                parts.append(f'<div class="image-cell"{cell_style}><img src="{html.escape(src, quote=True)}"></div>')
             parts.append("</div>")
         if post.interactions:
             parts.append(interactions_to_html(post.interactions, output, file_uris=optimize_images))
@@ -1813,6 +1951,10 @@ def render_pdf_direct(output: Path, posts: list[ExportedPost], pdf_path: Path) -
         canv.drawString(margin_left, y, post_heading_text(post))
         y -= 17
         draw_wrapped(post.body, 11, 14.5)
+        if post.location:
+            draw_wrapped(f"📍 {post.location}", 9.5, 12, "#667085")
+        if post.video_cover_count:
+            draw_wrapped("🎬 视频封面（视频本体未导出）", 9.5, 12, "#667085")
         image_paths = [output / rel for rel in post.images]
         if len(image_paths) == 1:
             draw_single_image(image_paths[0])
@@ -1919,8 +2061,8 @@ def progress(label: str) -> None:
 
 
 
-async def main() -> int:
-    args = parse_args()
+async def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     try:
         if args.quiet:
             RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -1999,6 +2141,8 @@ async def _main_impl(args: argparse.Namespace) -> int:
         "only_self": only_self,
         "keep_interactions": keep_interactions,
         "export_contacts": export_contacts_enabled,
+        "max_posts": max(0, int(args.max_posts or 0)),
+        "order": args.order,
         "friend_inputs": friend_inputs,
     }
     (output / "params.json").write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2017,6 +2161,8 @@ async def _main_impl(args: argparse.Namespace) -> int:
         keep_interactions,
         contact_names,
         allow_download=not args.no_download,
+        max_posts=max(0, int(args.max_posts or 0)),
+        order=args.order,
     )
     progress("生成 PDF")
     html_path = write_pdf_html(output, exported_posts)

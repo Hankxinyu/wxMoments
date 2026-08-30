@@ -1487,9 +1487,13 @@ def _query_decrypted_sqlite(
 
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 
+    # A live-copied SNS database can have an ordering index that remains
+    # readable but is internally inconsistent. In that state SQLite may repeat
+    # a row across LIMIT/OFFSET pages without raising DatabaseError. Force a
+    # table scan so pagination is based on authoritative table rows.
     sql = f"""
         SELECT tid, user_name, content
-        FROM SnsTimeLine
+        FROM SnsTimeLine NOT INDEXED
         {where_sql}
         ORDER BY tid DESC
         LIMIT ? OFFSET ?
@@ -1500,9 +1504,22 @@ def _query_decrypted_sqlite(
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(sql, params_with_page).fetchall()
-    except sqlite3.OperationalError as e:
-        logger.warning("[sns] query failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"sns.db query failed: {e}")
+    except sqlite3.DatabaseError as e:
+        # If even the temporary sort fails, recover all readable table rows and
+        # reproduce the requested page in memory.
+        logger.warning("[sns] index-free ordered query failed, trying in-memory recovery: %s", e)
+        recovery_sql = f"""
+            SELECT tid, user_name, content
+            FROM SnsTimeLine NOT INDEXED
+            {where_sql}
+        """
+        try:
+            recovered = conn.execute(recovery_sql, params).fetchall()
+            recovered.sort(key=lambda row: int(row["tid"] or 0), reverse=True)
+            rows = recovered[offset : offset + limit + 1]
+        except sqlite3.DatabaseError as recovery_error:
+            logger.warning("[sns] index-free recovery failed: %s", recovery_error)
+            raise HTTPException(status_code=500, detail=f"sns.db query failed: {recovery_error}")
     finally:
         conn.close()
 

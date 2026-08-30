@@ -41,7 +41,7 @@ if not exist "%PYTHON_EXE%" (
 call :install_deps
 if errorlevel 1 exit /b 1
 
-"%PYTHON_EXE%" "src\wxmoments.py" %*
+"%PYTHON_EXE%" "src\wxmoments_cli.py" %*
 if errorlevel 1 goto fail
 if "%~1"=="" pause
 exit /b 0

@@ -464,6 +464,22 @@ WECHAT_EMOJI_ALIASES: dict[str, str] = {'Smile': '🙂',
 
 _WECHAT_EMOJI_SHORTCODE_RE = re.compile(r"\[([^\[\]]{1,32})\]")
 
+# Older iPhone/WeChat builds stored SoftBank emoji in Unicode's private-use
+# area. Modern fonts intentionally have no glyphs there, so translate the
+# legacy values before Markdown/HTML/PDF rendering.
+LEGACY_SOFTBANK_PUA_EMOJI: dict[int, str] = {
+    0xE022: "❤️",
+    0xE033: "🎄",
+    0xE112: "🎁",
+    0xE132: "🏁",
+    0xE325: "🔔",
+    0xE332: "⭕",
+    0xE415: "😄",
+    0xE417: "😚",
+    0xE443: "🌀",
+    0xE448: "🎅",
+}
+
 
 def emojify_wechat_shortcodes(text: str) -> str:
     """Replace WeChat built-in [shortcode] tokens with close Unicode emoji."""
@@ -480,4 +496,5 @@ def emojify_wechat_shortcodes(text: str) -> str:
             or match.group(0)
         )
 
-    return _WECHAT_EMOJI_SHORTCODE_RE.sub(replace, str(text))
+    converted = _WECHAT_EMOJI_SHORTCODE_RE.sub(replace, str(text))
+    return converted.translate(LEGACY_SOFTBANK_PUA_EMOJI)
