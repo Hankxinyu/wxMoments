@@ -248,9 +248,19 @@ wxMoments 读取本机缓存，不会直接向微信服务器请求完整历史�
 }
 ```
 
-`wechat_data_root` 可以指向微信数据根目录、账号目录或包含 `db_storage` 的目录。不要把自动取得的 64 位十六进制 `db_key` 写进公开仓库。
+`wechat_data_root` 可以指向微信数据根目录、账号目录或包含 `db_storage` 的目录。电脑上存在多个 `wxid_*` 时，工具会优先选择 `sns.db` 或其 WAL 最近写入的账号，而不是数据库最大的账号，并在终端显示所选目录。正式归档前应先用 `--dry-run` 核对日期范围；如果仍然选错，请把 `wechat_data_root` 指向目标账号的精确 `wxid_*` 目录，并填写 `account`。不要把自动取得的 64 位十六进制 `db_key` 写进公开仓库。
 
 ## 常见问题
+
+切换或新登录微信账号时，先阅读 [新账号账号误选与图片密钥故障排查](docs/NEW_ACCOUNT_TROUBLESHOOTING.md)。其中记录了多账号目录误选、`sns.db-wal` 活跃度判断，以及新版微信无扩展名 SNS V2 图片缓存的处理方式。
+
+### 新账号却导出了旧账号的数据
+
+先停止正式归档。保持目标账号在线并在自己的朋友圈滚动几条，再运行 `archive --until ... --dry-run`，核对终端显示的账号目录与缓存日期。工具默认按 `sns.db`、`sns.db-wal`、`sns.db-shm` 的最近写入时间选择账号；若仍不正确，把 `config/config.json` 中的 `wechat_data_root` 指向目标账号的精确 `wxid_*` 目录，并填写 `account`。不同账号必须使用不同的状态文件和输出目录。
+
+### 文字正常但图片密钥失败或图片全缺失
+
+新版微信可能把朋友圈 V2 图片保存为 `cache/<年月>/Sns/Img/<分片>/<无扩展名哈希文件>`，不再只有旧版 `*_t.dat`。当前项目已经兼容这类缓存，并用 V2 魔数验真。先确认账号目录正确且已在朋友圈加载过带图片的动态；若日志中的 V2 模板数仍为 0，按 [专项排查文档](docs/NEW_ACCOUNT_TROUBLESHOOTING.md) 检查缓存路径是否再次变化。
 
 ### 找不到朋友圈数据库
 
@@ -293,6 +303,7 @@ AI 或开发人员只在微信新版兼容、异常数据库、缺失依赖或�
 - `src/wxmoments.py`：数据库、SNS、媒体、互动及单次 PDF 导出核心。
 - `src/wxmoments_archive.py`：断点、动态 ID 去重、自动分卷、事务、清单和 PDF 校验。
 - `src/wxmoments_cli.py`：兼容普通模式并路由 `archive` 子命令。
+- `docs/NEW_ACCOUNT_TROUBLESHOOTING.md`：切换账号、账号目录误选和新版 V2 图片模板的维护手册。
 - `run.bat`：Windows 环境与依赖启动入口。
 - `tests/`：位置、完整比例图片、视频封面、分页去重和归档事务测试。
 

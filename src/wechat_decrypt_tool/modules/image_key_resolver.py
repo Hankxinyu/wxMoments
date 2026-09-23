@@ -246,6 +246,33 @@ def _offer_recent_template_files(
         return
 
 
+def _offer_recent_sns_files(
+    directory: Path,
+    heap: list[tuple[int, str, str]],
+    capacity: int,
+) -> None:
+    """Collect extensionless SNS image cache files for V2 template probing."""
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                    if stat.st_size < V2_CIPHERTEXT_START + IMAGE_AES_KEY_LENGTH + 2:
+                        continue
+                except OSError:
+                    continue
+                path_text = str(Path(entry.path))
+                heap_item = (stat.st_mtime_ns, path_text.casefold(), path_text)
+                if len(heap) < capacity:
+                    heapq.heappush(heap, heap_item)
+                elif heap_item > heap[0]:
+                    heapq.heapreplace(heap, heap_item)
+    except OSError:
+        return
+
+
 def _recent_paths(heap: list[tuple[int, str, str]]) -> tuple[Path, ...]:
     return tuple(Path(item[2]) for item in sorted(heap, reverse=True))
 
@@ -273,6 +300,27 @@ def _collect_preferred_paths(account_dir: Path, capacity: int) -> tuple[Path, ..
                     break
                 visited_dirs += 1
                 _offer_recent_template_files(img_dir, heap, capacity)
+    return _recent_paths(heap)
+
+
+def _collect_sns_paths(account_dir: Path, capacity: int) -> tuple[Path, ...]:
+    cache_root = account_dir / "cache"
+    month_dirs = _list_child_dirs(cache_root)
+    month_dirs.sort(key=lambda path: (-_safe_mtime_ns(path), path.name.casefold()))
+    heap: list[tuple[int, str, str]] = []
+    visited_dirs = 0
+    for month_dir in month_dirs:
+        for relative in (("Sns", "Img"), ("sns", "img")):
+            image_root = month_dir.joinpath(*relative)
+            if not image_root.is_dir():
+                continue
+            shard_dirs = _list_child_dirs(image_root)
+            shard_dirs.sort(key=lambda path: path.name.casefold())
+            for shard_dir in shard_dirs:
+                if visited_dirs >= _MAX_PREFERRED_DIRS:
+                    return _recent_paths(heap)
+                visited_dirs += 1
+                _offer_recent_sns_files(shard_dir, heap, capacity)
     return _recent_paths(heap)
 
 
@@ -351,6 +399,9 @@ def scan_v2_templates(
     root = Path(account_dir)
     discovery_capacity = max(limit * 4, 64)
     preferred_paths = _collect_preferred_paths(root, discovery_capacity)
+    sns_paths = _collect_sns_paths(root, discovery_capacity)
+    if sns_paths:
+        preferred_paths = tuple(dict.fromkeys((*preferred_paths, *sns_paths)))
     templates, files_scanned = _read_v2_templates(preferred_paths, limit)
     used_fallback = False
 

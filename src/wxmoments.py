@@ -359,6 +359,27 @@ def iter_account_candidates(root: Path, account_hint: str = "") -> list[AccountI
     return uniq
 
 
+def _sns_activity_score(sns_path: Path) -> tuple[int, int]:
+    """Rank account caches by recent SNS writes, then by database size.
+
+    WeChat may keep several logged-out accounts under the same data root.  The
+    largest sns.db is often an older, long-used account, so size alone is not a
+    reliable signal for the account that is currently logged in.  Active WCDB
+    writes may land in the WAL before the main database is checkpointed.
+    """
+    latest_mtime_ns = 0
+    database_size = 0
+    for index, path in enumerate((sns_path, Path(f"{sns_path}-wal"), Path(f"{sns_path}-shm"))):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        latest_mtime_ns = max(latest_mtime_ns, int(stat.st_mtime_ns))
+        if index == 0:
+            database_size = int(stat.st_size)
+    return latest_mtime_ns, database_size
+
+
 def find_account(config: dict[str, Any]) -> AccountInfo:
     account_hint = str(config.get("account") or "").strip()
     configured_root = str(config.get("wechat_data_root") or "").strip()
@@ -367,18 +388,21 @@ def find_account(config: dict[str, Any]) -> AccountInfo:
         for item in re.split(r"[;\n]", configured_root)
         if item.strip()
     ] if configured_root else default_wechat_roots()
-    candidates: list[tuple[int, AccountInfo]] = []
+    candidates_by_path: dict[str, tuple[tuple[int, int], AccountInfo]] = {}
     for root in roots:
         for item in iter_account_candidates(root, account_hint):
             sns_path = item.db_storage_dir / "sns" / "sns.db"
             if not sns_path.exists():
                 sns_path = item.db_storage_dir / "sns.db"
             try:
-                size = int(sns_path.stat().st_size)
+                candidate_key = os.path.normcase(str(item.db_storage_dir.resolve()))
             except OSError:
-                size = 0
-            candidates.append((size, item))
-    if not candidates:
+                candidate_key = os.path.normcase(str(item.db_storage_dir))
+            score = _sns_activity_score(sns_path)
+            previous = candidates_by_path.get(candidate_key)
+            if previous is None or score > previous[0]:
+                candidates_by_path[candidate_key] = (score, item)
+    if not candidates_by_path:
         searched = "、".join(str(p) for p in roots)
         raise FileNotFoundError(
             "没有找到微信朋友圈数据库。\n"
@@ -387,7 +411,18 @@ def find_account(config: dict[str, Any]) -> AccountInfo:
             "请在 config/config.json 的 wechat_data_root 中填写微信数据目录，例如 "
             r"C:\Users\你的用户名\Documents\WeChat Files 或 D:\微信文件。"
         )
-    return max(candidates, key=lambda item: item[0])[1]
+    candidates = list(candidates_by_path.values())
+    score, selected = max(candidates, key=lambda item: item[0])
+    if len(candidates) > 1 and not account_hint:
+        selected_time = datetime.fromtimestamp(score[0] / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S") if score[0] else "未知"
+        print(
+            f"[account] 检测到 {len(candidates)} 个朋友圈账号缓存；"
+            f"按最近写入时间选择 {selected.wxid_dir}（{selected_time}）。\n"
+            "[account] 如果这不是当前登录账号，请在 config/config.json 中把 "
+            "wechat_data_root 指向正确的 wxid_* 目录，或填写 account。",
+            flush=True,
+        )
+    return selected
 
 
 def _normalize_pasted_path(value: str) -> Path:
